@@ -1,114 +1,132 @@
 # AI Job Seeker Agent
 
-An autonomous/semi-autonomous agent that parses resumes, improves candidate profiles, aggregates job/internship listings across MNCs and startups, runs LLM-driven skill-gap analysis, and assists (but does not blindly automate) the application step via a Playwright pre-fill browser.
+A local job-search assistant with a Streamlit dashboard and FastAPI backend. It parses PDF resumes, searches Google Jobs through SerpApi, compares jobs with a resume, tracks applications, and can prefill supported application forms for a person to review.
 
-## 1. System Architecture
+## Features
 
-```
-┌────────────────────┐        HTTP/JSON         ┌──────────────────────────┐
-│   Streamlit (app.py)│ ───────────────────────▶ │   FastAPI (main.py)      │
-│  - Resume upload UI │ ◀─────────────────────── │  - REST endpoints        │
-│  - Job search UI    │                          │  - Orchestrates agent,   │
-│  - Gap analysis UI   │                          │    scraper, DB          │
-│  - Apply-assistant   │                          └───────────┬──────────────┘
-│    trigger button    │                                      │
-└──────────────────────┘                                      │
-                                                                │
-                    ┌───────────────────────────────────────────┼───────────────────────────┐
-                    │                                            │                            │
-                    ▼                                            ▼                            ▼
-        ┌───────────────────────┐                  ┌───────────────────────┐     ┌────────────────────────┐
-        │ agent.py (LangChain)   │                  │ scraper.py             │     │ apply_assistant.py      │
-        │ - Groq (Llama 3.3)     │                  │ - SerpApi Google Jobs  │     │ - Playwright, headed    │
-        │ - parse_resume()       │                  │   (title/company/desc/ │     │   browser               │
-        │ - improve_profile()    │                  │   actual apply URL)    │     │ - Fills name/email/     │
-        │ - analyze_gap()        │                  └───────────┬────────────┘     │   GitHub/resume upload  │
-        └───────────┬────────────┘                              │                  │ - Human clicks Submit   │
-                    │                                            │                  └────────────┬────────────┘
-                    │                                            │                                │
-                    ▼                                            ▼                                │
-        ┌───────────────────────────────────────────────────────────────────────────────────────────┐
-        │                              PostgreSQL (+ pgvector)                                       │
-        │  users │ profiles (parsed resume JSONB) │ jobs (+ embedding) │ gap_analyses │ applications  │
-        └───────────────────────────────────────────────────────────────────────────────────────────┘
+- Upload a PDF resume and extract its contact details, skills, experience, and education.
+- Get AI-assisted resume feedback and job-specific skill-gap analysis.
+- Search job listings through the SerpApi Google Jobs engine, or add a job from its URL.
+- Track saved applications and update their status.
+- Ask questions about a parsed resume and job search in the chat assistant.
+- Optionally prefill application forms in a visible browser. The assistant does not submit applications.
+
+## Architecture
+
+```text
+Streamlit dashboard (frontend/app.py)
+              |
+              | HTTP
+              v
+FastAPI API (backend/main.py)
+       |           |            |
+       v           v            v
+  LangChain      SerpApi    PostgreSQL
+  + Groq       Google Jobs  + SQLAlchemy
 ```
 
-**Why this shape**
+The API uses SQLAlchemy to create its application tables when it starts. The SQL script also enables PostgreSQL extensions and includes an optional vector column for future use.
 
-- **Streamlit talks only to FastAPI**, never directly to the DB or the LLM. This keeps the UI stateless/swappable and lets the same backend later serve a real frontend (React, mobile, etc.) with zero changes.
-- **FastAPI is the orchestrator.** It never calls the LLM or scraper directly with business logic inline — it delegates to `agent.py` (reasoning) and `scraper.py` (data acquisition), and persists everything through SQLAlchemy models.
-- **`agent.py` isolates all prompt engineering and LLM I/O.** Every LLM call returns a validated Pydantic object (via LangChain's tool-calling structured output), so a bad/partial LLM response fails loudly (Pydantic `ValidationError`) instead of corrupting the DB with malformed JSON.
-- **`scraper.py` uses the SerpApi Google Jobs API**, not raw scraping of LinkedIn/Indeed/etc. Those sites' ToS generally prohibit automated scraping and they aggressively block headless browsers/CAPTCHA-gate scraping traffic. SerpApi aggregates Google for Jobs (which itself pulls from LinkedIn, Indeed, Glassdoor, and individual company ATS boards like Greenhouse/Lever) and returns the **actual employer apply URL**, which is exactly what's needed downstream. This is the compliant, reliable, production path.
-- **`apply_assistant.py` is intentionally semi-automated.** Modern ATS platforms (Workday, Greenhouse, Lever, iCIMS) use dynamic forms, CAPTCHAs, and bot-detection. Fully auto-submitting applications is fragile, easy to break silently, and can violate a given employer's terms of use. Instead, Playwright launches a **visible, headed browser**, best-effort fills known fields (name, email, phone, LinkedIn, GitHub, resume upload), and stops — a human reviews and clicks Submit. This is the reliable, ToS-respecting middle ground the spec calls for.
+## Requirements
 
-## 2. Database Schema
+- Python 3.10 or newer
+- Docker Desktop (or another PostgreSQL server)
+- A [Groq API key](https://console.groq.com/keys) for AI features
+- A [SerpApi API key](https://serpapi.com/) for job search
+- `psql` only if you want to apply the optional SQL schema script manually
 
-See [`sql/schema.sql`](sql/schema.sql). Summary:
+## Setup on Windows
 
-| Table | Purpose |
-|---|---|
-| `users` | Account identity (email-based; swap in real auth later) |
-| `profiles` | One resume per user: raw text + LLM-parsed structured JSON (`skills`, `experience`, `education`, `contact_info`) |
-| `jobs` | Scraped listings: title, company, description, `apply_url` (the actual employer link), source, optional pgvector `embedding` for future semantic matching |
-| `gap_analyses` | Result of comparing a profile against a job: match %, missing requirements, recommendations — all JSONB so the LLM's structured output maps 1:1 |
-| `applications` | Tracks state per (user, job): `saved → prefilled → applied → interview/offer/rejected` |
+Run these commands from the project directory in PowerShell:
 
-`pgvector` is enabled so `jobs.embedding` can later back semantic "find similar jobs to what I'm good at" search — the gap-analysis flow itself uses the LLM directly and doesn't require it, so it's optional infrastructure for a v2 feature, not a hard dependency today.
+```powershell
+# Start PostgreSQL with the pgvector extension available
+docker run --name jsb-postgres `
+  -e POSTGRES_PASSWORD=postgres `
+  -e POSTGRES_DB=job_seeker_bot `
+  -p 5432:5432 `
+  -d ankane/pgvector
 
-## 3. Project Layout
+# Create and activate a virtual environment
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
 
-```
-job_seeker_bot/
-├── README.md
-├── .env.example
-├── requirements.txt
-├── sql/schema.sql
-├── backend/
-│   ├── config.py            # env-driven settings
-│   ├── database.py          # SQLAlchemy engine/session
-│   ├── models.py            # ORM tables
-│   ├── schemas.py           # API request/response DTOs
-│   ├── resume_parser.py     # PDF -> text
-│   ├── agent.py             # LangChain + Gemini: parsing, improvement, gap analysis
-│   ├── scraper.py           # SerpApi Google Jobs client
-│   ├── apply_assistant.py   # Playwright pre-fill assistant
-│   └── main.py               # FastAPI app
-└── frontend/
-    └── app.py                # Streamlit dashboard
-```
-
-## 4. Setup
-
-```bash
-# 1. Postgres (with pgvector) — via Docker is easiest:
-docker run --name jsb-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=job_seeker_bot -p 5432:5432 -d ankane/pgvector
-
-# 2. Python deps
-python -m venv .venv && source .venv/bin/activate   # or .venv\Scripts\activate on Windows
-pip install -r requirements.txt
+# Install dependencies and the browser used by the application helper
+python -m pip install -r requirements.txt
 playwright install chromium
 
-# 3. Configure
-cp .env.example .env
-# then fill in GROQ_API_KEY and SERPAPI_API_KEY
+# Create your local configuration
+Copy-Item .env.example .env
+```
 
-# 4. Load schema
-psql "$DATABASE_URL" -f sql/schema.sql
-# (main.py also auto-creates tables on startup via SQLAlchemy for local dev convenience)
+Edit `.env` and set `DATABASE_URL`, `GROQ_API_KEY`, and `SERPAPI_API_KEY`. For the Docker command above, the database URL should point to `localhost:5432/job_seeker_bot` and use the `postgres` user and password. Keep `.env` private; it is excluded from Git.
 
-# 5. Run backend
+Set `DATABASE_URL` to `postgresql+psycopg2://postgres:postgres@localhost:5432/job_seeker_bot` for the Docker command above. The API creates the tables it needs on startup. If you also want the optional extension and vector-column setup from [`sql/schema.sql`](sql/schema.sql), run the script once before starting the API:
+
+```powershell
+psql -h localhost -U postgres -d job_seeker_bot -f sql/schema.sql
+```
+
+The SQL script is optional and should only be applied once to a new database. If you skip it, the API creates its application tables automatically.
+
+## Run the application
+
+Start the backend from the project directory:
+
+```powershell
 uvicorn backend.main:app --reload --port 8000
+```
 
-# 6. Run frontend (separate terminal)
+In a second PowerShell terminal, activate the same virtual environment and start the dashboard:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
 streamlit run frontend/app.py
 ```
 
-Get a SerpApi key at https://serpapi.com (Google Jobs engine) and a Groq API key (free tier, no card required) at https://console.groq.com/keys.
+Open the Streamlit URL shown in the terminal (usually `http://localhost:8501`). The API documentation is available at `http://localhost:8000/docs`.
 
-## 5. Notes & Trade-offs
+On macOS or Linux, activate the environment with `source .venv/bin/activate` and copy the configuration with `cp .env.example .env`; the install and run commands are otherwise the same.
 
-- **Model:** defaults to `llama-3.3-70b-versatile` (`GROQ_MODEL` env var) via Groq — free tier, no billing setup required, no quota-provisioning gotchas. Swap `GROQ_MODEL` for any other model Groq hosts; nothing else in the code needs to change.
-- **The apply assistant must run where a display exists** (your laptop), since Playwright launches a real, visible Chromium window for the human to review. It is designed to be triggered from the Streamlit app itself (running locally) rather than from a server-hosted FastAPI instance.
-- **No destructive automation:** the assistant never clicks Submit. It fills fields and stops.
-#   j o b - s e e k i n g - a g e n t  
- 
+## Configuration
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | SQLAlchemy connection URL for PostgreSQL |
+| `GROQ_API_KEY` | API key used for resume parsing, feedback, gap analysis, and chat |
+| `GROQ_MODEL` | Groq model name; defaults to `llama-3.3-70b-versatile` |
+| `SERPAPI_API_KEY` | API key used for Google Jobs search |
+| `BACKEND_URL` | Backend URL used by Streamlit; defaults to `http://localhost:8000` |
+| `UPLOAD_DIR` | Local directory for uploaded resumes; defaults to `./uploads` |
+
+Job search requires SerpApi. AI features require Groq. The backend can start without either key, but the corresponding features will not work until configured.
+
+## Project layout
+
+```text
+.
+├── backend/
+│   ├── agent.py             # LangChain and Groq features
+│   ├── apply_assistant.py   # Visible-browser application form helper
+│   ├── config.py            # Environment-based settings
+│   ├── database.py          # SQLAlchemy engine and sessions
+│   ├── job_fetcher.py       # Fetch job details from a supplied URL
+│   ├── main.py              # FastAPI routes
+│   ├── matching.py          # Resume-to-job matching
+│   ├── models.py            # SQLAlchemy models
+│   ├── resume_parser.py     # PDF text extraction
+│   ├── schemas.py           # API request and response models
+│   └── scraper.py           # SerpApi Google Jobs client
+├── frontend/
+│   └── app.py               # Streamlit dashboard
+├── sql/
+│   └── schema.sql           # PostgreSQL schema and optional vector setup
+├── .env.example
+└── requirements.txt
+```
+
+## Privacy and application assistance
+
+Resume files are stored locally in `uploads/`, which is excluded from Git. Resume text is sent to Groq when you use AI features, and job-search queries are sent to SerpApi. Review the providers' policies before using the application with personal data.
+
+The application helper opens a visible Chromium browser and attempts to fill supported fields. Review the form yourself and submit it manually; the helper does not click Submit. Run the backend on the computer with the browser display, not on a headless server, when using this feature.
